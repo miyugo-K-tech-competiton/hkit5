@@ -1,8 +1,12 @@
+#!/usr/bin/python3
+
 import math
 import time
 
 import serial
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from geometry_msgs.msg import Twist, TransformStamped
 from nav_msgs.msg import Odometry
@@ -44,8 +48,16 @@ class CmdVelBridge(Node):
         self.range_pub = self.create_publisher(Range, 'ultrasonic', 10)
         self.estop_pub = self.create_publisher(Bool, 'emergency_stop', 10)
         self.tf_br = TransformBroadcaster(self)
-        self.create_subscription(Twist, 'cmd_vel', self.cb_cmd, 10)
-        self.create_timer(0.005, self.read_serial)
+
+        # 멀티스레드: cmd_vel -> 시리얼 쓰기와 시리얼 읽기(odom/초음파)를 다른 스레드로 분리해
+        # 바퀴 명령이 수신 처리에 밀리지 않게 한다.
+        # 쓰기는 cb_cmd, 읽기는 read_serial 한 곳씩이라 같은 포트를 동시에 써도 안전하고,
+        # odom 상태(x, y, th, prev)는 read_serial 스레드만 만진다.
+        cmd_group = MutuallyExclusiveCallbackGroup()
+        serial_group = MutuallyExclusiveCallbackGroup()
+        self.create_subscription(Twist, 'cmd_vel', self.cb_cmd, 10,
+                                 callback_group=cmd_group)
+        self.create_timer(0.005, self.read_serial, callback_group=serial_group)
 
     # ---- cmd_vel -> V,좌,우 ----
     def to_raw(self, wheel_v):
@@ -148,11 +160,20 @@ class CmdVelBridge(Node):
 def main():
     rclpy.init()
     node = CmdVelBridge()
+    executor = MultiThreadedExecutor(num_threads=2)  # 콜백 그룹 2개 -> 스레드 2개
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
+    except Exception:
+        # Ctrl-C 때 시그널 핸들러가 context 를 먼저 내리면 spin 이 RCLError 로 끝난다.
+        # context 가 이미 내려간 경우만 정상 종료로 보고, 실행 중 오류는 그대로 올린다.
+        if rclpy.ok():
+            raise
     finally:
+        # 콜백 스레드를 먼저 멈춰야 정지 명령 뒤에 주행 명령이 끼어들지 않는다
+        executor.shutdown()
         try:
             node.ser.write(b'V,0,0\n')
         except Exception:

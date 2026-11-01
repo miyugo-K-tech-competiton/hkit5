@@ -1,5 +1,11 @@
+#!/usr/bin/python3
+
 import math
+import threading
+
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.duration import Duration
 from geometry_msgs.msg import Twist
@@ -52,15 +58,23 @@ class AvoidanceNode(Node):
         self.ref_x = self.ref_y = self.ref_th = 0.0
         self.cooldown_until = self.get_clock().now()
 
+        # 멀티스레드: 센서 콜백(감지/비상정지/odom)과 제어 타이머가 서로 다른 스레드에서 돈다.
+        # 두 쪽이 같이 쓰는 상태값(위의 self.*)은 self.lock 으로 보호한다.
+        self.lock = threading.Lock()
+        sensor_group = MutuallyExclusiveCallbackGroup()
+        control_group = MutuallyExclusiveCallbackGroup()
+
         self.create_subscription(Detection2DArray, self.get_parameter('detections_topic').value,
-                                 self.cb_det, 10)
-        self.create_subscription(Bool, 'emergency_stop', self.cb_estop, 10)
-        self.create_subscription(Odometry, 'odom', self.cb_odom, 10)
+                                 self.cb_det, 10, callback_group=sensor_group)
+        self.create_subscription(Bool, 'emergency_stop', self.cb_estop, 10,
+                                 callback_group=sensor_group)
+        self.create_subscription(Odometry, 'odom', self.cb_odom, 10,
+                                 callback_group=sensor_group)
         self.pub = self.create_publisher(Twist, 'cmd_vel_avoid', 10)
-        self.create_timer(0.05, self.step)
+        self.create_timer(0.05, self.step, callback_group=control_group)
 
     def cb_det(self, msg):
-        self.last_sp = self.get_clock().now()   # 빈 배열도 '데이터 살아있음'으로 취급
+        now = self.get_clock().now()
         g = self.get_parameter
         min_conf = g('min_conf').value
         stop_ids = set(int(x) for x in g('stop_class_ids').value)
@@ -82,18 +96,26 @@ class AvoidanceNode(Node):
                     person_stop = True
                 elif cid in avoid_ids and dist < avoid_d:
                     vehicle_avoid = True
-        self.person_stop = person_stop
-        self.obstacle = vehicle_avoid and not person_stop
+        with self.lock:
+            self.last_sp = now   # 빈 배열도 '데이터 살아있음'으로 취급
+            self.person_stop = person_stop
+            self.obstacle = vehicle_avoid and not person_stop
 
     def cb_estop(self, msg):
-        self.rear_blocked = msg.data
+        with self.lock:
+            self.rear_blocked = msg.data
 
     def cb_odom(self, msg):
-        self.x = msg.pose.pose.position.x
-        self.y = msg.pose.pose.position.y
         q = msg.pose.pose.orientation
-        self.th = math.atan2(2.0 * q.w * q.z, 1.0 - 2.0 * q.z * q.z)
+        th = math.atan2(2.0 * q.w * q.z, 1.0 - 2.0 * q.z * q.z)
+        # x, y, th 는 한 번에 바꿔야 제어 쪽이 섞인 값을 읽지 않는다
+        with self.lock:
+            self.x = msg.pose.pose.position.x
+            self.y = msg.pose.pose.position.y
+            self.th = th
 
+    # 아래 set_state/moved/turned/sp_age/sp_lost 는 step 안에서만 불리므로
+    # self.lock 을 이미 잡은 상태다 (다시 잡지 않는다).
     def set_state(self, s):
         self.state = s
         self.ref_x, self.ref_y, self.ref_th = self.x, self.y, self.th
@@ -120,6 +142,10 @@ class AvoidanceNode(Node):
         return age is None or age > self.get_parameter('sp_timeout').value
 
     def step(self):
+        with self.lock:
+            self._step()
+
+    def _step(self):
         now = self.get_clock().now()
 
         # 감지 데이터가 끊기면 오래된 사람/차량 상태를 해제 (정지가 영구히 남는 것 방지)
@@ -169,11 +195,19 @@ class AvoidanceNode(Node):
 def main():
     rclpy.init()
     node = AvoidanceNode()
+    executor = MultiThreadedExecutor(num_threads=2)  # 콜백 그룹 2개 -> 스레드 2개
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
+    except Exception:
+        # Ctrl-C 때 시그널 핸들러가 context 를 먼저 내리면 spin 이 RCLError 로 끝난다.
+        # context 가 이미 내려간 경우만 정상 종료로 보고, 실행 중 오류는 그대로 올린다.
+        if rclpy.ok():
+            raise
     finally:
+        executor.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

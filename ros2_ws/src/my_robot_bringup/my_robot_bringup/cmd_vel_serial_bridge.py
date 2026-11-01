@@ -1,10 +1,13 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 
 import math
+import threading
 import time
 from typing import Optional
 
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.duration import Duration
 from geometry_msgs.msg import TransformStamped, Twist
 from nav_msgs.msg import Odometry
@@ -115,10 +118,18 @@ class CmdVelSerialBridge(Node):
             20,
         )
         self.transform_broadcaster = TransformBroadcaster(self)
-        self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_callback, 10)
+
+        # 멀티스레드: cmd_vel 수신과 시리얼/odom 타이머를 다른 스레드로 분리한다.
+        # 두 스레드가 같이 쓰는 값은 desired_command, last_cmd_vel_time 뿐이라
+        # 이 둘만 command_lock 으로 묶는다 (시리얼 포트는 타이머 스레드만 쓴다).
+        self.command_lock = threading.Lock()
+        cmd_group = MutuallyExclusiveCallbackGroup()
+        timer_group = MutuallyExclusiveCallbackGroup()
+        self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_callback, 10,
+                                 callback_group=cmd_group)
 
         # A short timer gives quick response while the heartbeat remains slow.
-        self.create_timer(0.05, self.timer_callback)
+        self.create_timer(0.05, self.timer_callback, callback_group=timer_group)
 
         self.get_logger().info(
             f'Bridge ready: /cmd_vel -> {self.serial_port} '
@@ -126,11 +137,13 @@ class CmdVelSerialBridge(Node):
         )
 
     def cmd_vel_callback(self, message: Twist) -> None:
-        self.last_cmd_vel_time = time.monotonic()
-        self.desired_command = self.twist_to_command(
+        command = self.twist_to_command(
             message.linear.x,
             message.angular.z,
         )
+        with self.command_lock:
+            self.last_cmd_vel_time = time.monotonic()
+            self.desired_command = command
 
     def twist_to_command(self, linear_x: float, angular_z: float) -> str:
         linear_active = abs(linear_x) > self.linear_deadband
@@ -178,10 +191,11 @@ class CmdVelSerialBridge(Node):
 
         self.read_serial_feedback()
 
-        if now - self.last_cmd_vel_time > self.cmd_timeout_sec:
-            command = 'X'
-        else:
-            command = self.desired_command
+        with self.command_lock:
+            if now - self.last_cmd_vel_time > self.cmd_timeout_sec:
+                command = 'X'
+            else:
+                command = self.desired_command
 
         # The ultrasonic sensor faces backward. Only reverse motion is blocked.
         if command == 'S' and self.reverse_is_unsafe(now):
@@ -450,14 +464,24 @@ class CmdVelSerialBridge(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = CmdVelSerialBridge()
+    executor = MultiThreadedExecutor(num_threads=2)  # 콜백 그룹 2개 -> 스레드 2개
+    executor.add_node(node)
 
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
+    except Exception:
+        # Ctrl-C 때 시그널 핸들러가 context 를 먼저 내리면 spin 이 RCLError 로 끝난다.
+        # context 가 이미 내려간 경우만 정상 종료로 보고, 실행 중 오류는 그대로 올린다.
+        if rclpy.ok():
+            raise
     finally:
+        # 타이머 스레드를 먼저 멈춘 뒤 destroy_node 에서 X(정지)를 보낸다
+        executor.shutdown()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
