@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.8)
 project(my_robot_bringup)
 
-# 도커 이미지(ros:humble_ep_v01)의 PATH 맨 앞에 libcamera 빌드용 meson venv 가 있어서
-# CMake 가 catkin_pkg 없는 venv 파이썬을 잡는다. ROS 가 쓰는 시스템 파이썬으로 고정한다.
+# PATH 에 다른 venv(예: libcamera 빌드용 meson venv)가 앞서 있으면 CMake 가
+# catkin_pkg 없는 파이썬을 잡는다. ROS 가 쓰는 시스템 파이썬으로 고정한다.
 if(NOT DEFINED Python3_EXECUTABLE AND EXISTS /usr/bin/python3)
   set(Python3_EXECUTABLE /usr/bin/python3)
 endif()

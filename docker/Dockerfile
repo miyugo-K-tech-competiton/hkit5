@@ -1,21 +1,23 @@
+# hkit5 EP 파트 도커 이미지 (Raspberry Pi 4 전용, arm64)
+#
+# 빌드: docker/build_image.sh  (Pi 4 에서 libcamera 컴파일 때문에 40분 이상 걸린다)
 FROM ros:humble
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG MESON_VERSION=1.11.2
+# 호스트(Raspberry Pi OS)의 libcamera 와 같은 버전을 쓴다 (dpkg -l | grep libcamera)
 ARG LIBCAMERA_VERSION=v0.7.2+rpt20260817
 ARG RPICAM_APPS_VERSION=v1.12.0
 
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
-ENV PATH="/opt/meson-venv/bin:${PATH}"
 
-# ROS 패키지, Python 이미지 처리 모듈, 카메라 빌드 의존성
+# ROS 패키지, 노드가 쓰는 Python 모듈, 카메라 빌드 의존성
 RUN apt-get update && apt-get install -y --no-install-recommends \
     locales \
-    ros-humble-usb-cam \
-    ros-humble-compressed-image-transport \
     ros-humble-rplidar-ros \
     ros-humble-vision-msgs \
+    ros-humble-dynamixel-sdk \
     python3-serial \
     python3-opencv \
     python3-numpy \
@@ -36,26 +38,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && locale-gen en_US.UTF-8 \
     && rm -rf /var/lib/apt/lists/*
 
-# Meson과 libcamera 빌드에 필요한 Python 모듈을 같은 가상환경에 설치
+# Meson 과 libcamera 빌드용 Python 모듈은 별도 venv 에만 둔다.
+# PATH 에 넣지 않는다: 넣으면 colcon/CMake 와 노드가 이 venv 의 python3 를 잡아
+# catkin_pkg, numpy 등을 못 찾는다. 빌드 단계에서만 경로를 직접 지정한다.
 RUN python3 -m venv /opt/meson-venv \
     && /opt/meson-venv/bin/pip install --no-cache-dir --upgrade pip \
     && /opt/meson-venv/bin/pip install --no-cache-dir \
        "meson==${MESON_VERSION}" \
        Jinja2 PyYAML ply \
-    && /opt/meson-venv/bin/python -c \
-       "import jinja2, yaml, ply; print('Python build modules OK')" \
-    && meson --version
+    && /opt/meson-venv/bin/meson --version
 
-# Raspberry Pi용 libcamera 빌드 및 설치
+# Raspberry Pi 4 용 libcamera (VC4 파이프라인만)
 RUN mkdir -p /tmp/camera-build \
     && cd /tmp/camera-build \
     && git clone --depth=1 --branch "${LIBCAMERA_VERSION}" \
        https://github.com/raspberrypi/libcamera.git \
     && cd libcamera \
-    && meson setup build \
+    && PATH="/opt/meson-venv/bin:${PATH}" meson setup build \
        --buildtype=release \
-       -Dpipelines=rpi/vc4,rpi/pisp \
-       -Dipas=rpi/vc4,rpi/pisp \
+       -Dpipelines=rpi/vc4 \
+       -Dipas=rpi/vc4 \
        -Dv4l2=true \
        -Dgstreamer=disabled \
        -Dtest=false \
@@ -68,12 +70,12 @@ RUN mkdir -p /tmp/camera-build \
     && ninja -C build install \
     && ldconfig
 
-# rpicam-vid 등 카메라 명령 빌드 및 설치
+# rpicam-vid (camera_node 가 MJPEG 스트림을 받는 데 사용)
 RUN cd /tmp/camera-build \
     && git clone --depth=1 --branch "${RPICAM_APPS_VERSION}" \
        https://github.com/raspberrypi/rpicam-apps.git \
     && cd rpicam-apps \
-    && meson setup build \
+    && PATH="/opt/meson-venv/bin:${PATH}" meson setup build \
        -Denable_libav=disabled \
        -Denable_drm=disabled \
        -Denable_egl=disabled \
@@ -85,12 +87,11 @@ RUN cd /tmp/camera-build \
     && ninja -C build install \
     && ldconfig \
     && rpicam-vid --version \
-    && rpicam-hello --version \
     && rm -rf /tmp/camera-build
 
-# ROS 2 언더레이 및 오버레이 워크스페이스 자동 소싱
+# ROS 2 언더레이와 워크스페이스 자동 소싱 (워크스페이스는 첫 colcon build 이후에 생긴다)
 RUN echo "source /opt/ros/humble/setup.bash" >> /root/.bashrc && \
-    echo "source /root/ep_part/ros2_ws/install/setup.bash" >> /root/.bashrc
+    echo "[ -f /root/hkit5/ros2_ws/install/setup.bash ] && source /root/hkit5/ros2_ws/install/setup.bash" >> /root/.bashrc
 
-WORKDIR /root
+WORKDIR /root/hkit5/ros2_ws
 CMD ["/bin/bash"]
