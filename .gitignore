@@ -1,0 +1,9 @@
+# colcon 빌드 산물
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# 파이썬 빌드 산물
+__pycache__/
+*.py[cod]
+*.egg-info/
