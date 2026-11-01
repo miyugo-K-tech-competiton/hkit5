@@ -35,12 +35,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpng-dev \
     libboost-program-options-dev \
     libexif-dev \
+    libudev-dev \
     && locale-gen en_US.UTF-8 \
     && rm -rf /var/lib/apt/lists/*
 
 # Meson 과 libcamera 빌드용 Python 모듈은 별도 venv 에만 둔다.
-# PATH 에 넣지 않는다: 넣으면 colcon/CMake 와 노드가 이 venv 의 python3 를 잡아
-# catkin_pkg, numpy 등을 못 찾는다. 빌드 단계에서만 경로를 직접 지정한다.
+# ENV PATH 에 넣지 않는다: 넣으면 colcon/CMake 와 노드가 이 venv 의 python3 를 잡아
+# catkin_pkg, numpy 등을 못 찾는다. 카메라 빌드 RUN 단계 안에서만 export 한다
+# (ninja 가 실행하는 코드 생성 스크립트도 jinja2 가 있는 이 python3 를 써야 한다).
 RUN python3 -m venv /opt/meson-venv \
     && /opt/meson-venv/bin/pip install --no-cache-dir --upgrade pip \
     && /opt/meson-venv/bin/pip install --no-cache-dir \
@@ -49,12 +51,13 @@ RUN python3 -m venv /opt/meson-venv \
     && /opt/meson-venv/bin/meson --version
 
 # Raspberry Pi 4 용 libcamera (VC4 파이프라인만)
-RUN mkdir -p /tmp/camera-build \
+RUN export PATH="/opt/meson-venv/bin:${PATH}" \
+    && mkdir -p /tmp/camera-build \
     && cd /tmp/camera-build \
     && git clone --depth=1 --branch "${LIBCAMERA_VERSION}" \
        https://github.com/raspberrypi/libcamera.git \
     && cd libcamera \
-    && PATH="/opt/meson-venv/bin:${PATH}" meson setup build \
+    && meson setup build \
        --buildtype=release \
        -Dpipelines=rpi/vc4 \
        -Dipas=rpi/vc4 \
@@ -71,11 +74,12 @@ RUN mkdir -p /tmp/camera-build \
     && ldconfig
 
 # rpicam-vid (camera_node 가 MJPEG 스트림을 받는 데 사용)
-RUN cd /tmp/camera-build \
+RUN export PATH="/opt/meson-venv/bin:${PATH}" \
+    && cd /tmp/camera-build \
     && git clone --depth=1 --branch "${RPICAM_APPS_VERSION}" \
        https://github.com/raspberrypi/rpicam-apps.git \
     && cd rpicam-apps \
-    && PATH="/opt/meson-venv/bin:${PATH}" meson setup build \
+    && meson setup build \
        -Denable_libav=disabled \
        -Denable_drm=disabled \
        -Denable_egl=disabled \
